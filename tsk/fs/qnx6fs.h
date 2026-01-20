@@ -5,8 +5,11 @@
 extern "C" {
 #endif
 
+// qnx6fs.c includes tsk_fs_i.h; keep this header lightweight and
+// avoid depending on internal img headers that may not be in include paths.
 #include "tsk_fs.h"
 
+// Forward declaration to avoid including img headers here.
 struct TSK_IMG_INFO;
 typedef struct TSK_IMG_INFO TSK_IMG_INFO;
 

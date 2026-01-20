@@ -1,15 +1,6 @@
 /*
  * The Sleuth Kit
  * QNX6 file system support (read-only)
- *
- * Autopsy-ready behaviors:
- *  - qnx6fs_open initializes TSK_FS_INFO correctly and returns &qfs->fs_info
- *  - dir_open_meta does not double-free TSK_FS_NAME (dir owns entries)
- *  - file_add_meta fills TSK_FS_META fields (type, times, uid/gid, size)
- *  - load_attrs builds a DEFAULT non-resident runlist for content reads
- *  - inode_walk iterates inodes and calls the callback
- *
- * This file assumes little-endian on-disk structures.
  */
 
 #include "tsk_fs_i.h"
@@ -21,9 +12,11 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
+#include <string.h>
 #ifdef _MSC_VER
 #include <malloc.h>
 #endif
+
 
 /* MSVC/Windows: ensure these exist */
 #ifndef S_IFLNK
@@ -121,23 +114,90 @@ typedef struct {
 
 #define QNX6_UNUSED_PTR 0xFFFFFFFFu
 
-/* ---------------- low-level helpers ---------------- */
+#include "tsk_fs_i.h"   // fr TSK_FS_BLOCK, tsk_fs_block_alloc, tsk_fs_block_set
 
-static TSK_FS_META_TYPE_ENUM
-qnx6_mode_to_meta_type(uint16_t mode)
+static TSK_FS_BLOCK_FLAG_ENUM
+qnx6fs_block_getflags(TSK_FS_INFO* fs, TSK_DADDR_T addr)
 {
-    switch (mode & S_IFMT) {
-    case S_IFREG: return TSK_FS_META_TYPE_REG;
-    case S_IFDIR: return TSK_FS_META_TYPE_DIR;
-    case S_IFLNK: return TSK_FS_META_TYPE_LNK;
-    case S_IFCHR: return TSK_FS_META_TYPE_CHR;
-    case S_IFBLK: return TSK_FS_META_TYPE_BLK;
-    case S_IFIFO: return TSK_FS_META_TYPE_FIFO;
-#ifdef S_IFSOCK
-    case S_IFSOCK: return TSK_FS_META_TYPE_SOCK;
-#endif
-    default: return TSK_FS_META_TYPE_UNDEF;
+    if (fs == NULL) {
+        return TSK_FS_BLOCK_FLAG_UNUSED;
     }
+
+    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
+
+    /* sehr simple Heuristik:
+       - alles vor data_start = META
+       - ab data_start = CONT
+       - alles als ALLOC markieren (fr icat reicht das zum Lesen)
+    */
+    TSK_DADDR_T data_start_blk = (TSK_DADDR_T)(qfs->data_start / (uint64_t)fs->block_size);
+
+    if (addr < data_start_blk) {
+        return (TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_META);
+    }
+    else {
+        return (TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_CONT);
+    }
+}
+
+
+static uint8_t
+qnx6fs_istat(TSK_FS_INFO* fs, TSK_FS_ISTAT_FLAG_ENUM flags,
+    FILE* hFile, TSK_INUM_T inum, TSK_DADDR_T numblock, int32_t sec_skew)
+{
+    (void)numblock;
+
+    if (fs == NULL || hFile == NULL) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_FS_ARG);
+        tsk_error_set_errstr("qnx6fs_istat: NULL argument");
+        return 1;
+    }
+
+    TSK_FS_FILE* fs_file = tsk_fs_file_open_meta(fs, NULL, inum);
+    if (fs_file == NULL || fs_file->meta == NULL) {
+        if (fs_file) tsk_fs_file_close(fs_file);
+        return 1;
+    }
+
+    TSK_FS_META* meta = fs_file->meta;
+
+    tsk_fprintf(hFile, "Inode: %llu\n", (unsigned long long)inum);
+    tsk_fprintf(hFile, "Type: %u\n", (unsigned)meta->type);
+    tsk_fprintf(hFile, "Mode: %o\n", (unsigned)meta->mode);
+    tsk_fprintf(hFile, "UID / GID: %u / %u\n", (unsigned)meta->uid, (unsigned)meta->gid);
+    tsk_fprintf(hFile, "Size: %llu\n", (unsigned long long)meta->size);
+
+    tsk_fprintf(hFile, "MTim: %lld\n", (long long)(meta->mtime + sec_skew));
+    tsk_fprintf(hFile, "ATim: %lld\n", (long long)(meta->atime + sec_skew));
+    tsk_fprintf(hFile, "CTim: %lld\n", (long long)(meta->ctime + sec_skew));
+
+    if ((flags & TSK_FS_ISTAT_RUNLIST) && meta->attr) {
+        /* NOTE: Adjust this call to match YOUR tsk_fs_attrlist_get() signature */
+        const TSK_FS_ATTR* attr = tsk_fs_attrlist_get(meta->attr, TSK_FS_ATTR_TYPE_DEFAULT);
+        /* If your signature is (attrlist, type) use:
+         * const TSK_FS_ATTR *attr = tsk_fs_attrlist_get(meta->attr, TSK_FS_ATTR_TYPE_DEFAULT);
+         */
+
+        if (attr && (attr->flags & TSK_FS_ATTR_NONRES) && attr->nrd.run) {
+            tsk_fprintf(hFile, "\nData Runs:\n");
+            const TSK_FS_ATTR_RUN* run = attr->nrd.run;
+            while (run) {
+                if (run->flags & TSK_FS_ATTR_RUN_FLAG_SPARSE) {
+                    tsk_fprintf(hFile, "  off=%" PRIuDADDR " len=%" PRIuDADDR " SPARSE\n",
+                        run->offset, run->len);
+                }
+                else {
+                    tsk_fprintf(hFile, "  off=%" PRIuDADDR " addr=%" PRIuDADDR " len=%" PRIuDADDR "\n",
+                        run->offset, run->addr, run->len);
+                }
+                run = run->next;
+            }
+        }
+    }
+
+    tsk_fs_file_close(fs_file);
+    return 0;
 }
 
 
@@ -173,7 +233,7 @@ static uint64_t qnx6_data_start(uint32_t bs) {
 }
 
 static int qnx6_read_block(QNX6FS_INFO *qfs, uint32_t blk, uint8_t *out) {
-    TSK_OFF_T off = qfs->fs_info.offset + (TSK_OFF_T)qfs->data_start + (TSK_OFF_T)blk * (TSK_OFF_T)qfs->fs_info.block_size;
+    TSK_OFF_T off = qfs->fs_info.offset + (TSK_OFF_T)qfs->data_start + (TSK_OFF_T)blk * qfs->fs_info.block_size;
     return qnx6_read_img(qfs->fs_info.img_info, off, out, qfs->fs_info.block_size);
 }
 
@@ -222,7 +282,6 @@ static uint8_t *qnx6_read_file_bytes(QNX6FS_INFO *qfs, const uint32_t ptr0[16], 
 {
     uint32_t bs = (uint32_t)qfs->fs_info.block_size;
     if (offset >= fsize) { *out_len = 0; return NULL; }
-
     uint64_t max = fsize - offset;
     if ((uint64_t)size > max) size = (uint32_t)max;
 
@@ -259,7 +318,6 @@ static uint8_t *qnx6_read_file_bytes(QNX6FS_INFO *qfs, const uint32_t ptr0[16], 
 
 static int qnx6_read_inode(QNX6FS_INFO *qfs, TSK_INUM_T inum, QNX6_INODE *out) {
     if (inum < 1 || inum > qfs->fs_info.inum_count) return 1;
-    /* inode size is 128 bytes in our parser */
     uint64_t off = (uint64_t)(inum - 1) * 128u;
     uint32_t got = 0;
     uint8_t *raw = qnx6_read_file_bytes(qfs, qfs->rn_inodes.ptr, qfs->rn_inodes.level, qfs->rn_inodes.size,
@@ -291,83 +349,138 @@ static char *qnx6_get_longname(QNX6FS_INFO *qfs, uint32_t index, uint16_t *out_l
     return name;
 }
 
-/* ---------------- TSK callbacks ---------------- */
+static uint8_t
+qnx6fs_load_attrs(TSK_FS_FILE* fs_file)
+{
+    if (fs_file == NULL || fs_file->fs_info == NULL || fs_file->meta == NULL) {
+        return 1;
+    }
 
-static uint8_t qnx6fs_load_attrs(TSK_FS_FILE *fs_file) {
-    QNX6FS_INFO *qfs = (QNX6FS_INFO*)fs_file->fs_info;
+    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs_file->fs_info;
+
     QNX6_INODE ino;
-    if (!fs_file || !fs_file->meta) return 1;
-    if (qnx6_read_inode(qfs, fs_file->meta->addr, &ino)) return 1;
+    if (qnx6_read_inode(qfs, fs_file->meta->addr, &ino)) {
+        return 1;
+    }
 
     uint32_t bs = (uint32_t)qfs->fs_info.block_size;
     uint64_t fsize = tsk_getu64(TSK_LIT_ENDIAN, (const uint8_t*)&ino.size);
 
-    TSK_FS_ATTR *attr = tsk_fs_attrlist_getnew(fs_file->meta->attr, TSK_FS_ATTR_NONRES);
-    if (!attr) return 1;
+    /* Allocate attrlist lazily (icat expects this to be done here). */
+    if (fs_file->meta->attr == NULL) {
+        fs_file->meta->attr = tsk_fs_attrlist_alloc();
+        if (fs_file->meta->attr == NULL) {
+            tsk_error_reset();
+            tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
+            tsk_error_set_errstr("qnx6fs_load_attrs: cannot allocate attrlist");
+            return 1;
+        }
+    }
 
-    TSK_FS_ATTR_RUN *head = NULL;
-    TSK_FS_ATTR_RUN *tail = NULL;
+    /* Create a new NONRES attribute entry */
+    TSK_FS_ATTR* attr = tsk_fs_attrlist_getnew(fs_file->meta->attr, TSK_FS_ATTR_NONRES);
+    if (attr == NULL) {
+        return 1;
+    }
+
+    TSK_FS_ATTR_RUN* head = NULL;
+    TSK_FS_ATTR_RUN* tail = NULL;
+
+    const TSK_DADDR_T data_start_blk = (TSK_DADDR_T)(qfs->data_start / (uint64_t)bs);
 
     uint64_t off = 0;
+    int have_last = 0;
     TSK_DADDR_T last_addr = 0;
-    uint64_t last_off_blocks = 0;
+    TSK_DADDR_T last_off_blk = 0;
 
     while (off < fsize) {
         uint32_t ptr = qnx6_ptr_at_offset(qfs, ino.ptr, ino.level, off);
-        uint64_t off_blocks = off / bs;
+        TSK_DADDR_T off_blk = (TSK_DADDR_T)(off / bs);
 
         if (ptr != QNX6_UNUSED_PTR) {
-            if (tail && ((TSK_DADDR_T)ptr == last_addr + 1) && (off_blocks == last_off_blocks + 1)) {
+            TSK_DADDR_T addr = (TSK_DADDR_T)ptr + data_start_blk;
+
+            if (have_last && tail && (addr == last_addr + 1) && (off_blk == last_off_blk + 1)) {
                 tail->len++;
-            } else {
-                TSK_FS_ATTR_RUN *r = tsk_fs_attr_run_alloc();
-                if (!r) {
+            }
+            else {
+                TSK_FS_ATTR_RUN* r = tsk_fs_attr_run_alloc();
+                if (r == NULL) {
                     tsk_fs_attr_run_free(head);
                     return 1;
                 }
-                r->addr = (TSK_DADDR_T)ptr;
-                r->offset = (TSK_DADDR_T)off_blocks;
+
+                /* IMPORTANT: initialize fully */
+                memset(r, 0, sizeof(*r));
+                r->addr = addr;
+                r->offset = off_blk;
                 r->len = 1;
+                r->flags = TSK_FS_ATTR_RUN_FLAG_NONE;
+                r->crypto_id = 0;
                 r->next = NULL;
-                if (!head) head = r;
+
+                if (head == NULL) head = r;
                 else tail->next = r;
                 tail = r;
             }
-            last_addr = (TSK_DADDR_T)ptr;
-            last_off_blocks = off_blocks;
+
+            have_last = 1;
+            last_addr = addr;
+            last_off_blk = off_blk;
         }
+
         off += bs;
     }
 
-    /* DEFAULT attribute (non-resident). allocsize: round up to block. */
+    TSK_OFF_T size = (TSK_OFF_T)fsize;
     TSK_OFF_T allocsize = (TSK_OFF_T)(((fsize + bs - 1) / bs) * bs);
 
-    return tsk_fs_attr_set_run(fs_file, attr, head,
+    /*
+     * This call wires runlist into attr->nrd and sets sizes.
+     * For your branch: MUST pass TSK_FS_ATTR_NONRES as flags,
+     * otherwise the attribute may not be treated as non-resident.
+     */
+    if (tsk_fs_attr_set_run(fs_file, attr, head,
         NULL, TSK_FS_ATTR_TYPE_DEFAULT, 0,
-        (TSK_OFF_T)fsize, (TSK_OFF_T)fsize, allocsize,
-        TSK_FS_ATTR_FLAG_NONE, 0);
+        size, size, allocsize,
+        TSK_FS_ATTR_NONRES, 0)) {
+        /* on failure, avoid leaking runlist */
+        tsk_fs_attr_run_free(head);
+        return 1;
+    }
+
+    return 0;
 }
 
-static uint8_t qnx6fs_file_add_meta(TSK_FS_INFO *fs, TSK_FS_FILE *fs_file, TSK_INUM_T addr) {
-    QNX6FS_INFO *qfs = (QNX6FS_INFO*)fs;
+
+static uint8_t
+qnx6fs_file_add_meta(TSK_FS_INFO* fs, TSK_FS_FILE* fs_file, TSK_INUM_T addr)
+{
+    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
     QNX6_INODE ino;
+
+    if (fs == NULL || fs_file == NULL) {
+        return 1;
+    }
 
     if (qnx6_read_inode(qfs, addr, &ino)) {
         return 1;
     }
 
     if (fs_file->meta == NULL) {
-        if ((fs_file->meta = tsk_fs_meta_alloc(TSK_FS_META_TAG)) == NULL)
+        fs_file->meta = tsk_fs_meta_alloc(TSK_FS_META_TAG);
+        if (fs_file->meta == NULL) {
             return 1;
+        }
     }
 
-    TSK_FS_META *meta = fs_file->meta;
+    TSK_FS_META* meta = fs_file->meta;
     tsk_fs_meta_reset(meta);
 
     meta->addr = addr;
     meta->mode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode);
-    meta->uid  = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.uid);
-    meta->gid  = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.gid);
+    meta->uid = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.uid);
+    meta->gid = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.gid);
     meta->size = (TSK_OFF_T)tsk_getu64(TSK_LIT_ENDIAN, (const uint8_t*)&ino.size);
 
     meta->mtime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mtime);
@@ -375,21 +488,28 @@ static uint8_t qnx6fs_file_add_meta(TSK_FS_INFO *fs, TSK_FS_FILE *fs_file, TSK_I
     meta->ctime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.ctime);
     meta->crtime = 0;
 
-    /* allocation heuristic */
-    if (meta->mode == 0 && meta->size == 0) meta->flags = TSK_FS_META_FLAG_UNALLOC;
-    else meta->flags = TSK_FS_META_FLAG_ALLOC;
+    meta->flags = TSK_FS_META_FLAG_ALLOC;
 
+    /* Meta-Type aus POSIX mode ableiten */
     meta->type = TSK_FS_META_TYPE_UNDEF;
-    uint16_t fmt = meta->mode & S_IFMT;
-    if (fmt == S_IFDIR) meta->type = TSK_FS_META_TYPE_DIR;
-    else if (fmt == S_IFREG) meta->type = TSK_FS_META_TYPE_REG;
-    else if (fmt == S_IFLNK) meta->type = TSK_FS_META_TYPE_LNK;
-    else if (fmt == S_IFBLK) meta->type = TSK_FS_META_TYPE_BLK;
-    else if (fmt == S_IFCHR) meta->type = TSK_FS_META_TYPE_CHR;
-    else if (fmt == S_IFIFO) meta->type = TSK_FS_META_TYPE_FIFO;
-    else if (fmt == S_IFSOCK) meta->type = TSK_FS_META_TYPE_SOCK;
+    {
+        uint16_t fmt = meta->mode & S_IFMT;
+        if (fmt == S_IFDIR) meta->type = TSK_FS_META_TYPE_DIR;
+        else if (fmt == S_IFREG) meta->type = TSK_FS_META_TYPE_REG;
+        else if (fmt == S_IFLNK) meta->type = TSK_FS_META_TYPE_LNK;
+        else if (fmt == S_IFBLK) meta->type = TSK_FS_META_TYPE_BLK;
+        else if (fmt == S_IFCHR) meta->type = TSK_FS_META_TYPE_CHR;
+        else if (fmt == S_IFIFO) meta->type = TSK_FS_META_TYPE_FIFO;
+        else if (fmt == S_IFSOCK) meta->type = TSK_FS_META_TYPE_SOCK;
+    }
 
-    /* attrs are loaded lazily via load_attrs callback */
+    /*
+     * WICHTIG:
+     * meta->attr hier NICHT anlegen.
+     * icat/tsk_fs_file_walk() triggert load_attrs() nur wenn meta->attr == NULL.
+     */
+    meta->attr = NULL;
+
     return 0;
 }
 
@@ -450,37 +570,21 @@ static TSK_RETVAL_ENUM qnx6fs_dir_open_meta(TSK_FS_INFO *fs, TSK_FS_DIR **a_fs_d
             name = _strdup(shortname);
 #else
             name = strdup(shortname);
-#endif
+ #endif
+
             if (!name) continue;
         }
 
-        TSK_FS_NAME *fs_name = tsk_fs_name_alloc((size_t)nlen + 1, 0);
+        TSK_FS_NAME *fs_name = tsk_fs_name_alloc(nlen + 1, 0);
         if (!fs_name) { free(name); continue; }
 
         tsk_fs_name_reset(fs_name);
         strncpy(fs_name->name, name, fs_name->name_size - 1);
-        fs_name->name[fs_name->name_size - 1] = '\0';
         fs_name->meta_addr = (TSK_INUM_T)child;
         fs_name->flags = TSK_FS_NAME_FLAG_ALLOC;
 
-        /* best-effort type for nicer Autopsy/TSK display */
-        {
-            QNX6_INODE cino;
-            if (qnx6_read_inode(qfs, (TSK_INUM_T)child, &cino) == 0) {
-                uint16_t cmode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&cino.mode);
-                uint16_t cfmt = cmode & S_IFMT;
-                if (cfmt == S_IFDIR) fs_name->type = TSK_FS_NAME_TYPE_DIR;
-                else if (cfmt == S_IFREG) fs_name->type = TSK_FS_NAME_TYPE_REG;
-                else if (cfmt == S_IFLNK) fs_name->type = TSK_FS_NAME_TYPE_LNK;
-                else fs_name->type = TSK_FS_NAME_TYPE_UNDEF;
-            } else {
-                fs_name->type = TSK_FS_NAME_TYPE_UNDEF;
-            }
-        }
-
         tsk_fs_dir_add(dir, fs_name);
-        /* IMPORTANT: dir owns fs_name now (do NOT free it here) */
-
+        tsk_fs_name_free(fs_name);
         free(name);
     }
 
@@ -501,153 +605,130 @@ static uint8_t qnx6fs_fsstat(TSK_FS_INFO *fs, FILE *hFile) {
     return 0;
 }
 
-/* Minimal block walk: treats all blocks as allocated (stable for Autopsy). */
 static uint8_t
-qnx6fs_block_walk(TSK_FS_INFO* fs, TSK_DADDR_T start, TSK_DADDR_T end,
-    TSK_FS_BLOCK_WALK_FLAG_ENUM flags, TSK_FS_BLOCK_WALK_CB cb, void* ptr)
+qnx6fs_block_walk(TSK_FS_INFO* fs,
+    TSK_DADDR_T start, TSK_DADDR_T end,
+    TSK_FS_BLOCK_WALK_FLAG_ENUM flags,
+    TSK_FS_BLOCK_WALK_CB cb, void* ptr)
 {
-    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
-
-    if (start < 0) start = 0;
-    if (end >= fs->block_count) end = fs->block_count - 1;
-
-    const int aonly = (flags & TSK_FS_BLOCK_WALK_FLAG_AONLY) ? 1 : 0;
-
-    char* buf = NULL;
-    if (!aonly) {
-        buf = (char*)tsk_malloc((size_t)fs->block_size);
-        if (!buf) {
-            tsk_error_reset();
-            tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
-            tsk_error_set_errstr("qnx6fs_block_walk: cannot allocate block buffer");
-            return 1;
-        }
+    if (fs == NULL || cb == NULL) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_FS_ARG);
+        tsk_error_set_errstr("qnx6fs_block_walk: NULL argument");
+        return 1;
     }
 
-    for (TSK_DADDR_T blk = start; blk <= end; blk++) {
+    if (end < start) {
+        return 0;
+    }
 
-        // Minimal “Autopsy-ready” behavior:
-        // Ohne Bitmap-Analyse behandeln wir erstmal alles als alloc+cont.
-        if ((flags & TSK_FS_BLOCK_WALK_FLAG_UNALLOC) &&
-            !(flags & TSK_FS_BLOCK_WALK_FLAG_ALLOC)) {
-            continue;
-        }
+    TSK_FS_BLOCK* fs_block = tsk_fs_block_alloc(fs);
+    if (fs_block == NULL) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
+        tsk_error_set_errstr("qnx6fs_block_walk: cannot alloc fs_block");
+        return 1;
+    }
 
-        TSK_FS_BLOCK b;
-        memset(&b, 0, sizeof(b));
-        b.tag = TSK_FS_BLOCK_TAG;
-        b.fs_info = fs;
-        b.addr = blk;
-        b.flags = TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_CONT;
-        if (aonly) {
-            b.flags |= TSK_FS_BLOCK_FLAG_AONLY;
-            b.buf = NULL;
+    for (TSK_DADDR_T addr = start; addr <= end; addr++) {
+
+        /* echte Flags des Blocks (ALLOC/CONT/META usw.) */
+        TSK_FS_BLOCK_FLAG_ENUM blk_flags = TSK_FS_BLOCK_FLAG_UNUSED;
+        if (fs->block_getflags) {
+            blk_flags = fs->block_getflags(fs, addr);
         }
         else {
-            b.buf = buf;
+            blk_flags = (TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_CONT);
+        }
 
-            // read actual data
-            // Falls du schon qnx6_read_block(qfs, ...) hast, nutze die:
-            // if (qnx6_read_block(qfs, (uint32_t)blk, (uint8_t*)buf)) { ... }
-            //
-            // Minimal: rohe Blockadresse = blk * block_size + data_start
-            // (wenn du data_start bereits gesetzt hast)
-            TSK_OFF_T off = fs->offset + (TSK_OFF_T)qfs->data_start + (TSK_OFF_T)blk * (TSK_OFF_T)fs->block_size;
-            ssize_t r = tsk_img_read(fs->img_info, off, buf, fs->block_size);
-            if (r != (ssize_t)fs->block_size) {
-                free(buf);
-                tsk_error_reset();
-                tsk_error_set_errno(TSK_ERR_FS_READ);
-                tsk_error_set_errstr("qnx6fs_block_walk: cannot read block");
-                return 1;
+        /* Filter nach Walk-Flags */
+        if (flags != TSK_FS_BLOCK_WALK_FLAG_NONE) {
+
+            if ((flags & TSK_FS_BLOCK_WALK_FLAG_ALLOC) &&
+                !(blk_flags & TSK_FS_BLOCK_FLAG_ALLOC)) {
+                continue;
             }
 
-            b.flags |= TSK_FS_BLOCK_FLAG_RAW;
+            if ((flags & TSK_FS_BLOCK_WALK_FLAG_UNALLOC) &&
+                !(blk_flags & TSK_FS_BLOCK_FLAG_UNALLOC)) {
+                continue;
+            }
+
+            if ((flags & TSK_FS_BLOCK_WALK_FLAG_CONT) &&
+                !(blk_flags & TSK_FS_BLOCK_FLAG_CONT)) {
+                continue;
+            }
+
+            if ((flags & TSK_FS_BLOCK_WALK_FLAG_META) &&
+                !(blk_flags & TSK_FS_BLOCK_FLAG_META)) {
+                continue;
+            }
         }
 
-        TSK_WALK_RET_ENUM ret = cb(&b, ptr);
-        if (ret == TSK_WALK_STOP) {
-            if (buf) free(buf);
-            return 0;
-        }
-        if (ret == TSK_WALK_ERROR) {
-            if (buf) free(buf);
-            return 1;
-        }
-    }
+        /* Wenn AONLY: keinen Content lesen */
+        if (flags & TSK_FS_BLOCK_WALK_FLAG_AONLY) {
+            TSK_FS_BLOCK_FLAG_ENUM out_flags = (blk_flags | TSK_FS_BLOCK_FLAG_AONLY);
+        tsk_fs_block_set(fs, fs_block, addr, out_flags, NULL);
 
-    if (buf) free(buf);
-    return 0;
-}
-
-
-static uint8_t
-qnx6fs_inode_walk(TSK_FS_INFO* fs, TSK_INUM_T start, TSK_INUM_T end,
-    TSK_FS_META_FLAG_ENUM flags, TSK_FS_META_WALK_CB cb, void* ptr)
-{
-    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
-
-    if (start < fs->first_inum) start = fs->first_inum;
-    if (end > fs->last_inum) end = fs->last_inum;
-
-    for (TSK_INUM_T inum = start; inum <= end; inum++) {
-
-        // Wenn du hier schon “alloc/unalloc” sauber bestimmen willst:
-        // qnx6 inode lesen und mode==0 => unalloc
-        QNX6_INODE ino;
-        int have_inode = (qnx6_read_inode(qfs, inum, &ino) == 0);
-        uint16_t mode = have_inode ? tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode) : 0;
-        int is_alloc = (have_inode && mode != 0);
-
-        if ((flags & TSK_FS_META_FLAG_ALLOC) && !is_alloc) continue;
-        if ((flags & TSK_FS_META_FLAG_UNALLOC) && is_alloc) continue;
-
-        TSK_FS_FILE* fs_file = tsk_fs_file_alloc(fs);
-        if (!fs_file) {
-            tsk_error_reset();
-            tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
-            tsk_error_set_errstr("qnx6fs_inode_walk: cannot allocate fs_file");
-            return 1;
-        }
-
-        // füllt fs_file->meta (deine Funktion existiert ja schon)
-        if (fs->file_add_meta && fs->file_add_meta(fs, fs_file, inum)) {
-            tsk_fs_file_close(fs_file);
+            if (cb(fs_block, ptr)) {
+                tsk_fs_block_free(fs_block);
+                return 1;
+            }
             continue;
         }
 
-        // Meta-Flags setzen (ALLOC/UNALLOC)
-        if (fs_file->meta) {
-            fs_file->meta->flags = is_alloc ? TSK_FS_META_FLAG_ALLOC : TSK_FS_META_FLAG_UNALLOC;
-            fs_file->meta->type = have_inode ? qnx6_mode_to_meta_type(mode) : TSK_FS_META_TYPE_UNDEF;
+        /* Blockdaten lesen */
+        const TSK_OFF_T off = fs->offset + (TSK_OFF_T)addr * (TSK_OFF_T)fs->block_size;
+        ssize_t r = tsk_img_read(fs->img_info, off, (char*)fs_block->buf, fs->block_size);
+        if (r != (ssize_t)fs->block_size) {
+            tsk_error_reset();
+            tsk_error_set_errno(TSK_ERR_FS_READ);
+            tsk_error_set_errstr("qnx6fs_block_walk: cannot read block");
+            tsk_error_set_errstr2("block=%" PRIuDADDR, addr);
+            tsk_fs_block_free(fs_block);
+            return 1;
         }
 
-        TSK_WALK_RET_ENUM ret = cb(fs_file, ptr);
+        TSK_FS_BLOCK_FLAG_ENUM out_flags = (blk_flags | TSK_FS_BLOCK_FLAG_RAW);
+    tsk_fs_block_set(fs, fs_block, addr, out_flags, (char*)fs_block->buf);
 
-        tsk_fs_file_close(fs_file);
-
-        if (ret == TSK_WALK_STOP)
-            return 0;
-        if (ret == TSK_WALK_ERROR)
+        if (cb(fs_block, ptr)) {
+            tsk_fs_block_free(fs_block);
             return 1;
+        }
     }
 
+    tsk_fs_block_free(fs_block);
     return 0;
 }
 
+/* duplicate qnx6fs_block_getflags removed (was conflicting with earlier definition) */
+
+static uint8_t qnx6fs_inode_walk(TSK_FS_INFO *fs, TSK_INUM_T start, TSK_INUM_T end,
+    TSK_FS_META_FLAG_ENUM flags, TSK_FS_META_WALK_CB cb, void *ptr)
+{
+    (void)fs; (void)start; (void)end; (void)flags; (void)cb; (void)ptr;
+    tsk_error_reset();
+    tsk_error_set_errno(TSK_ERR_FS_UNSUPFUNC);
+    tsk_error_set_errstr("qnx6fs_inode_walk: not implemented");
+    return 1;
+}
 
 static void qnx6fs_close(TSK_FS_INFO *fs) {
+    if (fs == NULL) return;
+    /* fs points to the start of QNX6FS_INFO because fs_info is the first field */
     QNX6FS_INFO *qfs = (QNX6FS_INFO*)fs;
-    if (!qfs) return;
 
     tsk_deinit_lock(&qfs->fs_info.list_inum_named_lock);
     tsk_deinit_lock(&qfs->fs_info.orphan_dir_lock);
 
-    /* fs_info is embedded; free only the outer allocation */
-    free(qfs);
+    /* tsk_fs_free() will free the structure it is passed (which is qfs). */
+    tsk_fs_free(fs);
 }
 
-/* ---------------- open ---------------- */
+static uint8_t qnx6fs_istat(TSK_FS_INFO* fs, TSK_FS_ISTAT_FLAG_ENUM flags,
+    FILE* hFile, TSK_INUM_T inum, TSK_DADDR_T numblock, int32_t sec_skew);
+
 
 TSK_FS_INFO*
 qnx6fs_open(TSK_IMG_INFO* img_info, TSK_OFF_T offset, TSK_FS_TYPE_ENUM fstype, const char* pass, uint8_t test)
@@ -727,6 +808,8 @@ qnx6fs_open(TSK_IMG_INFO* img_info, TSK_OFF_T offset, TSK_FS_TYPE_ENUM fstype, c
     if (qfs == NULL) {
         if (test) return NULL;
         tsk_error_reset();
+        // Older/newer TSK branches use different error codes for allocation
+        // failures. TSK_ERR_AUX_MALLOC is widely supported.
         tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
         tsk_error_set_errstr("qnx6fs_open: Cannot allocate QNX6FS_INFO");
         return NULL;
@@ -750,7 +833,7 @@ qnx6fs_open(TSK_IMG_INFO* img_info, TSK_OFF_T offset, TSK_FS_TYPE_ENUM fstype, c
     qfs->rn_longfile = qfs->sb.longfile;
     qfs->rn_bitmap = qfs->sb.bitmap;
 
-    /* Initialize embedded fs_info */
+    // Initialize embedded fs_info
     qfs->fs_info.tag = TSK_FS_INFO_TAG;
     qfs->fs_info.img_info = img_info;
     qfs->fs_info.offset = offset;
@@ -771,18 +854,19 @@ qnx6fs_open(TSK_IMG_INFO* img_info, TSK_OFF_T offset, TSK_FS_TYPE_ENUM fstype, c
     qfs->fs_info.first_inum = 1;
     qfs->fs_info.last_inum = qfs->fs_info.inum_count;
 
-    /* Set function pointers */
+    // Set function pointers
     qfs->fs_info.block_walk = qnx6fs_block_walk;
+    qfs->fs_info.block_getflags = qnx6fs_block_getflags;
     qfs->fs_info.inode_walk = qnx6fs_inode_walk;
     qfs->fs_info.file_add_meta = qnx6fs_file_add_meta;
     qfs->fs_info.load_attrs = qnx6fs_load_attrs;
     qfs->fs_info.dir_open_meta = qnx6fs_dir_open_meta;
     qfs->fs_info.fsstat = qnx6fs_fsstat;
+    qfs->fs_info.istat = qnx6fs_istat;
     qfs->fs_info.close = qnx6fs_close;
 
     tsk_init_lock(&qfs->fs_info.list_inum_named_lock);
     tsk_init_lock(&qfs->fs_info.orphan_dir_lock);
 
-    /* IMPORTANT: return pointer to embedded TSK_FS_INFO */
-    return &qfs->fs_info;
+    return (TSK_FS_INFO*)qfs;
 }
