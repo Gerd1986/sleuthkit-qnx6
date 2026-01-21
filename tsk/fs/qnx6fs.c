@@ -140,6 +140,16 @@ qnx6fs_block_getflags(TSK_FS_INFO* fs, TSK_DADDR_T addr)
     }
 }
 
+/* Return the default attribute type for file content.
+ * This TSK branch requires fs->get_default_attr_type to be set for icat/tsk_fs_file_walk().
+ */
+static TSK_FS_ATTR_TYPE_ENUM
+qnx6fs_get_default_attr_type(const TSK_FS_FILE *fs_file)
+{
+    (void)fs_file;
+    return TSK_FS_ATTR_TYPE_DEFAULT;
+}
+
 
 static uint8_t
 qnx6fs_istat(TSK_FS_INFO* fs, TSK_FS_ISTAT_FLAG_ENUM flags,
@@ -703,16 +713,68 @@ qnx6fs_block_walk(TSK_FS_INFO* fs,
 }
 
 /* duplicate qnx6fs_block_getflags removed (was conflicting with earlier definition) */
-
-static uint8_t qnx6fs_inode_walk(TSK_FS_INFO *fs, TSK_INUM_T start, TSK_INUM_T end,
-    TSK_FS_META_FLAG_ENUM flags, TSK_FS_META_WALK_CB cb, void *ptr)
+static uint8_t qnx6fs_inode_walk(TSK_FS_INFO* fs, TSK_INUM_T start, TSK_INUM_T end,
+    TSK_FS_META_FLAG_ENUM flags, TSK_FS_META_WALK_CB cb, void* ptr)
 {
-    (void)fs; (void)start; (void)end; (void)flags; (void)cb; (void)ptr;
-    tsk_error_reset();
-    tsk_error_set_errno(TSK_ERR_FS_UNSUPFUNC);
-    tsk_error_set_errstr("qnx6fs_inode_walk: not implemented");
-    return 1;
+    if (fs == NULL || cb == NULL) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_FS_ARG);
+        tsk_error_set_errstr("qnx6fs_inode_walk: NULL argument");
+        return 1;
+    }
+
+    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
+
+    /* Clamp range */
+    if (start < fs->first_inum) start = fs->first_inum;
+    if (end > fs->last_inum) end = fs->last_inum;
+    if (start > end) return 0;
+
+    /* If caller didn't ask for either, nothing to do */
+    if ((flags & (TSK_FS_META_FLAG_ALLOC | TSK_FS_META_FLAG_UNALLOC)) == 0) {
+        return 0;
+    }
+
+    for (TSK_INUM_T inum = start; inum <= end; inum++) {
+        QNX6_INODE ino;
+        if (qnx6_read_inode(qfs, inum, &ino)) {
+            continue;
+        }
+
+        /* Simple allocation heuristic: mode == 0 -> unused inode */
+        uint16_t mode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode);
+        int is_alloc = (mode != 0);
+
+        if (is_alloc) {
+            if (!(flags & TSK_FS_META_FLAG_ALLOC)) continue;
+        }
+        else {
+            if (!(flags & TSK_FS_META_FLAG_UNALLOC)) continue;
+        }
+
+        /* Reuse open_meta so file_add_meta/load_attrs remain the single source of truth */
+        TSK_FS_FILE* fs_file = tsk_fs_file_open_meta(fs, NULL, inum);
+        if (fs_file == NULL || fs_file->meta == NULL) {
+            if (fs_file) tsk_fs_file_close(fs_file);
+            continue;
+        }
+
+        if (!is_alloc) {
+            fs_file->meta->flags &= ~TSK_FS_META_FLAG_ALLOC;
+            fs_file->meta->flags |= TSK_FS_META_FLAG_UNALLOC;
+        }
+
+        TSK_WALK_RET_ENUM ret = cb(fs_file, ptr);
+
+        tsk_fs_file_close(fs_file);
+
+        if (ret == TSK_WALK_ERROR) return 1;
+        if (ret == TSK_WALK_STOP) break;
+    }
+
+    return 0;
 }
+
 
 static void qnx6fs_close(TSK_FS_INFO *fs) {
     if (fs == NULL) return;
@@ -862,6 +924,7 @@ qnx6fs_open(TSK_IMG_INFO* img_info, TSK_OFF_T offset, TSK_FS_TYPE_ENUM fstype, c
     qfs->fs_info.load_attrs = qnx6fs_load_attrs;
     qfs->fs_info.dir_open_meta = qnx6fs_dir_open_meta;
     qfs->fs_info.fsstat = qnx6fs_fsstat;
+    qfs->fs_info.get_default_attr_type = qnx6fs_get_default_attr_type;
     qfs->fs_info.istat = qnx6fs_istat;
     qfs->fs_info.close = qnx6fs_close;
 
