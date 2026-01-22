@@ -17,7 +17,6 @@
 #include <malloc.h>
 #endif
 
-
 /* MSVC/Windows: ensure these exist */
 #ifndef S_IFLNK
 #define S_IFLNK 0120000
@@ -464,64 +463,70 @@ qnx6fs_load_attrs(TSK_FS_FILE* fs_file)
 
 
 static uint8_t
-qnx6fs_file_add_meta(TSK_FS_INFO* fs, TSK_FS_FILE* fs_file, TSK_INUM_T addr)
+qnx6fs_file_add_meta(TSK_FS_INFO* fs, TSK_FS_FILE* fs_file, TSK_INUM_T inum)
 {
     QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
     QNX6_INODE ino;
 
-    if (fs == NULL || fs_file == NULL) {
+    if (!fs || !fs_file)
         return 1;
-    }
 
-    if (qnx6_read_inode(qfs, addr, &ino)) {
+    if (qnx6_read_inode(qfs, inum, &ino))
         return 1;
-    }
 
     if (fs_file->meta == NULL) {
         fs_file->meta = tsk_fs_meta_alloc(TSK_FS_META_TAG);
-        if (fs_file->meta == NULL) {
+        if (fs_file->meta == NULL)
             return 1;
-        }
     }
 
     TSK_FS_META* meta = fs_file->meta;
     tsk_fs_meta_reset(meta);
 
-    meta->addr = addr;
+    meta->addr = inum;
+
+    /* Basic fields */
     meta->mode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode);
     meta->uid = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.uid);
     meta->gid = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.gid);
     meta->size = (TSK_OFF_T)tsk_getu64(TSK_LIT_ENDIAN, (const uint8_t*)&ino.size);
 
+    /* Times */
     meta->mtime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mtime);
     meta->atime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.atime);
     meta->ctime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.ctime);
-    meta->crtime = 0;
+    meta->crtime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.ftime); /* QNX */
 
-    meta->flags = TSK_FS_META_FLAG_ALLOC;
+    /* Allocation state */
+    if (meta->mode == 0) {
+        meta->flags = TSK_FS_META_FLAG_UNALLOC;
+        meta->type = TSK_FS_META_TYPE_UNDEF;
+        meta->size = 0;
+    }
+    else {
+        meta->flags = TSK_FS_META_FLAG_ALLOC;
 
-    /* Meta-Type aus POSIX mode ableiten */
-    meta->type = TSK_FS_META_TYPE_UNDEF;
-    {
         uint16_t fmt = meta->mode & S_IFMT;
-        if (fmt == S_IFDIR) meta->type = TSK_FS_META_TYPE_DIR;
-        else if (fmt == S_IFREG) meta->type = TSK_FS_META_TYPE_REG;
-        else if (fmt == S_IFLNK) meta->type = TSK_FS_META_TYPE_LNK;
-        else if (fmt == S_IFBLK) meta->type = TSK_FS_META_TYPE_BLK;
-        else if (fmt == S_IFCHR) meta->type = TSK_FS_META_TYPE_CHR;
-        else if (fmt == S_IFIFO) meta->type = TSK_FS_META_TYPE_FIFO;
+        if (fmt == S_IFDIR)  meta->type = TSK_FS_META_TYPE_DIR;
+        else if (fmt == S_IFREG)  meta->type = TSK_FS_META_TYPE_REG;
+        else if (fmt == S_IFLNK)  meta->type = TSK_FS_META_TYPE_LNK;
+        else if (fmt == S_IFCHR)  meta->type = TSK_FS_META_TYPE_CHR;
+        else if (fmt == S_IFBLK)  meta->type = TSK_FS_META_TYPE_BLK;
+        else if (fmt == S_IFIFO)  meta->type = TSK_FS_META_TYPE_FIFO;
         else if (fmt == S_IFSOCK) meta->type = TSK_FS_META_TYPE_SOCK;
+        else                     meta->type = TSK_FS_META_TYPE_UNDEF;
     }
 
     /*
-     * WICHTIG:
-     * meta->attr hier NICHT anlegen.
-     * icat/tsk_fs_file_walk() triggert load_attrs() nur wenn meta->attr == NULL.
+     * VERY IMPORTANT:
+     * Leave attr NULL so load_attrs() is triggered later.
      */
     meta->attr = NULL;
 
     return 0;
 }
+
+
 
 static TSK_RETVAL_ENUM qnx6fs_dir_open_meta(TSK_FS_INFO *fs, TSK_FS_DIR **a_fs_dir, TSK_INUM_T inum, int recursion_depth) {
     (void)recursion_depth;
@@ -615,11 +620,12 @@ static uint8_t qnx6fs_fsstat(TSK_FS_INFO *fs, FILE *hFile) {
     return 0;
 }
 
+#include "tsk/fs/tsk_fs_i.h"   // für tsk_fs_block_alloc/free + tsk_malloc (je nach Layout)
+
+
 static uint8_t
-qnx6fs_block_walk(TSK_FS_INFO* fs,
-    TSK_DADDR_T start, TSK_DADDR_T end,
-    TSK_FS_BLOCK_WALK_FLAG_ENUM flags,
-    TSK_FS_BLOCK_WALK_CB cb, void* ptr)
+qnx6fs_block_walk(TSK_FS_INFO* fs, TSK_DADDR_T start, TSK_DADDR_T end,
+    TSK_FS_BLOCK_WALK_FLAG_ENUM flags, TSK_FS_BLOCK_WALK_CB cb, void* ptr)
 {
     if (fs == NULL || cb == NULL) {
         tsk_error_reset();
@@ -628,81 +634,65 @@ qnx6fs_block_walk(TSK_FS_INFO* fs,
         return 1;
     }
 
-    if (end < start) {
-        return 0;
-    }
+    /* clamp range */
+    if (start < fs->first_block) start = fs->first_block;
+    if (end > fs->last_block) end = fs->last_block;
+    if (start > end) return 0;
 
     TSK_FS_BLOCK* fs_block = tsk_fs_block_alloc(fs);
     if (fs_block == NULL) {
-        tsk_error_reset();
-        tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
-        tsk_error_set_errstr("qnx6fs_block_walk: cannot alloc fs_block");
         return 1;
     }
 
     for (TSK_DADDR_T addr = start; addr <= end; addr++) {
 
-        /* echte Flags des Blocks (ALLOC/CONT/META usw.) */
-        TSK_FS_BLOCK_FLAG_ENUM blk_flags = TSK_FS_BLOCK_FLAG_UNUSED;
+        /* flags for this block */
+        TSK_FS_BLOCK_FLAG_ENUM blk_flags = (TSK_FS_BLOCK_FLAG_ENUM)0;
         if (fs->block_getflags) {
             blk_flags = fs->block_getflags(fs, addr);
         }
         else {
-            blk_flags = (TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_CONT);
+            /* fallback */
+            blk_flags = (TSK_FS_BLOCK_FLAG_ENUM)(TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_CONT);
         }
 
-        /* Filter nach Walk-Flags */
-        if (flags != TSK_FS_BLOCK_WALK_FLAG_NONE) {
-
-            if ((flags & TSK_FS_BLOCK_WALK_FLAG_ALLOC) &&
-                !(blk_flags & TSK_FS_BLOCK_FLAG_ALLOC)) {
-                continue;
-            }
-
-            if ((flags & TSK_FS_BLOCK_WALK_FLAG_UNALLOC) &&
-                !(blk_flags & TSK_FS_BLOCK_FLAG_UNALLOC)) {
-                continue;
-            }
-
-            if ((flags & TSK_FS_BLOCK_WALK_FLAG_CONT) &&
-                !(blk_flags & TSK_FS_BLOCK_FLAG_CONT)) {
-                continue;
-            }
-
-            if ((flags & TSK_FS_BLOCK_WALK_FLAG_META) &&
-                !(blk_flags & TSK_FS_BLOCK_FLAG_META)) {
-                continue;
-            }
-        }
-
-        /* Wenn AONLY: keinen Content lesen */
+        /* AONLY: don't read bytes */
         if (flags & TSK_FS_BLOCK_WALK_FLAG_AONLY) {
-            TSK_FS_BLOCK_FLAG_ENUM out_flags = (blk_flags | TSK_FS_BLOCK_FLAG_AONLY);
-        tsk_fs_block_set(fs, fs_block, addr, out_flags, NULL);
+            TSK_FS_BLOCK_FLAG_ENUM out_flags =
+                (TSK_FS_BLOCK_FLAG_ENUM)(blk_flags | TSK_FS_BLOCK_FLAG_AONLY);
 
-            if (cb(fs_block, ptr)) {
+            tsk_fs_block_set(fs, fs_block, addr, out_flags, NULL);
+
+            TSK_WALK_RET_ENUM r = cb(fs_block, ptr);
+            if (r == TSK_WALK_STOP) break;
+            if (r == TSK_WALK_ERROR) {
                 tsk_fs_block_free(fs_block);
                 return 1;
             }
             continue;
         }
 
-        /* Blockdaten lesen */
-        const TSK_OFF_T off = fs->offset + (TSK_OFF_T)addr * (TSK_OFF_T)fs->block_size;
-        ssize_t r = tsk_img_read(fs->img_info, off, (char*)fs_block->buf, fs->block_size);
-        if (r != (ssize_t)fs->block_size) {
+        /* read raw block bytes */
+        TSK_OFF_T off = fs->offset + (TSK_OFF_T)addr * (TSK_OFF_T)fs->block_size;
+        ssize_t rd = tsk_img_read(fs->img_info, off, (char*)fs_block->buf, fs->block_size);
+        if (rd != (ssize_t)fs->block_size) {
             tsk_error_reset();
             tsk_error_set_errno(TSK_ERR_FS_READ);
             tsk_error_set_errstr("qnx6fs_block_walk: cannot read block");
-            tsk_error_set_errstr2("block=%" PRIuDADDR, addr);
+            /* PRIuOFF macht bei dir immer wieder Stress -> cast + %llu */
+            tsk_error_set_errstr2("block=%" PRIuDADDR " off=%llu", addr, (unsigned long long)off);
             tsk_fs_block_free(fs_block);
             return 1;
         }
 
-        TSK_FS_BLOCK_FLAG_ENUM out_flags = (blk_flags | TSK_FS_BLOCK_FLAG_RAW);
-    tsk_fs_block_set(fs, fs_block, addr, out_flags, (char*)fs_block->buf);
+        /* RAW => buf valid */
+        tsk_fs_block_set(fs, fs_block, addr,
+            (TSK_FS_BLOCK_FLAG_ENUM)(blk_flags | TSK_FS_BLOCK_FLAG_RAW),
+            (char*)fs_block->buf);
 
-        if (cb(fs_block, ptr)) {
+        TSK_WALK_RET_ENUM r = cb(fs_block, ptr);
+        if (r == TSK_WALK_STOP) break;
+        if (r == TSK_WALK_ERROR) {
             tsk_fs_block_free(fs_block);
             return 1;
         }
@@ -712,8 +702,8 @@ qnx6fs_block_walk(TSK_FS_INFO* fs,
     return 0;
 }
 
-/* duplicate qnx6fs_block_getflags removed (was conflicting with earlier definition) */
-static uint8_t qnx6fs_inode_walk(TSK_FS_INFO* fs, TSK_INUM_T start, TSK_INUM_T end,
+static uint8_t
+qnx6fs_inode_walk(TSK_FS_INFO* fs, TSK_INUM_T start, TSK_INUM_T end,
     TSK_FS_META_FLAG_ENUM flags, TSK_FS_META_WALK_CB cb, void* ptr)
 {
     if (fs == NULL || cb == NULL) {
@@ -723,53 +713,46 @@ static uint8_t qnx6fs_inode_walk(TSK_FS_INFO* fs, TSK_INUM_T start, TSK_INUM_T e
         return 1;
     }
 
-    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
+    /* TSK convention: flags==0 => both */
+    if (flags == 0) {
+        flags = (TSK_FS_META_FLAG_ENUM)(TSK_FS_META_FLAG_ALLOC | TSK_FS_META_FLAG_UNALLOC);
+    }
 
-    /* Clamp range */
+    /* clamp */
     if (start < fs->first_inum) start = fs->first_inum;
     if (end > fs->last_inum) end = fs->last_inum;
     if (start > end) return 0;
 
-    /* If caller didn't ask for either, nothing to do */
-    if ((flags & (TSK_FS_META_FLAG_ALLOC | TSK_FS_META_FLAG_UNALLOC)) == 0) {
-        return 0;
-    }
-
     for (TSK_INUM_T inum = start; inum <= end; inum++) {
-        QNX6_INODE ino;
-        if (qnx6_read_inode(qfs, inum, &ino)) {
-            continue;
-        }
 
-        /* Simple allocation heuristic: mode == 0 -> unused inode */
-        uint16_t mode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode);
-        int is_alloc = (mode != 0);
-
-        if (is_alloc) {
-            if (!(flags & TSK_FS_META_FLAG_ALLOC)) continue;
-        }
-        else {
-            if (!(flags & TSK_FS_META_FLAG_UNALLOC)) continue;
-        }
-
-        /* Reuse open_meta so file_add_meta/load_attrs remain the single source of truth */
         TSK_FS_FILE* fs_file = tsk_fs_file_open_meta(fs, NULL, inum);
         if (fs_file == NULL || fs_file->meta == NULL) {
             if (fs_file) tsk_fs_file_close(fs_file);
-            continue;
+            continue; /* nicht hart failen, ils will "weiter" */
         }
 
-        if (!is_alloc) {
-            fs_file->meta->flags &= ~TSK_FS_META_FLAG_ALLOC;
-            fs_file->meta->flags |= TSK_FS_META_FLAG_UNALLOC;
+        /* Filter by alloc/unalloc */
+        const TSK_FS_META* m = fs_file->meta;
+        int is_alloc = (m->flags & TSK_FS_META_FLAG_ALLOC) ? 1 : 0;
+        if (is_alloc) {
+            if ((flags & TSK_FS_META_FLAG_ALLOC) == 0) {
+                tsk_fs_file_close(fs_file);
+                continue;
+            }
+        }
+        else {
+            if ((flags & TSK_FS_META_FLAG_UNALLOC) == 0) {
+                tsk_fs_file_close(fs_file);
+                continue;
+            }
         }
 
-        TSK_WALK_RET_ENUM ret = cb(fs_file, ptr);
+        TSK_WALK_RET_ENUM r = cb(fs_file, ptr);
 
         tsk_fs_file_close(fs_file);
 
-        if (ret == TSK_WALK_ERROR) return 1;
-        if (ret == TSK_WALK_STOP) break;
+        if (r == TSK_WALK_STOP) break;
+        if (r == TSK_WALK_ERROR) return 1;
     }
 
     return 0;
