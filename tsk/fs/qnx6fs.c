@@ -17,6 +17,7 @@
 #include <malloc.h>
 #endif
 
+
 /* MSVC/Windows: ensure these exist */
 #ifndef S_IFLNK
 #define S_IFLNK 0120000
@@ -463,70 +464,64 @@ qnx6fs_load_attrs(TSK_FS_FILE* fs_file)
 
 
 static uint8_t
-qnx6fs_file_add_meta(TSK_FS_INFO* fs, TSK_FS_FILE* fs_file, TSK_INUM_T inum)
+qnx6fs_file_add_meta(TSK_FS_INFO* fs, TSK_FS_FILE* fs_file, TSK_INUM_T addr)
 {
     QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
     QNX6_INODE ino;
 
-    if (!fs || !fs_file)
+    if (fs == NULL || fs_file == NULL) {
         return 1;
+    }
 
-    if (qnx6_read_inode(qfs, inum, &ino))
+    if (qnx6_read_inode(qfs, addr, &ino)) {
         return 1;
+    }
 
     if (fs_file->meta == NULL) {
         fs_file->meta = tsk_fs_meta_alloc(TSK_FS_META_TAG);
-        if (fs_file->meta == NULL)
+        if (fs_file->meta == NULL) {
             return 1;
+        }
     }
 
     TSK_FS_META* meta = fs_file->meta;
     tsk_fs_meta_reset(meta);
 
-    meta->addr = inum;
-
-    /* Basic fields */
+    meta->addr = addr;
     meta->mode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode);
     meta->uid = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.uid);
     meta->gid = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.gid);
     meta->size = (TSK_OFF_T)tsk_getu64(TSK_LIT_ENDIAN, (const uint8_t*)&ino.size);
 
-    /* Times */
     meta->mtime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mtime);
     meta->atime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.atime);
     meta->ctime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.ctime);
-    meta->crtime = (time_t)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&ino.ftime); /* QNX */
+    meta->crtime = 0;
 
-    /* Allocation state */
-    if (meta->mode == 0) {
-        meta->flags = TSK_FS_META_FLAG_UNALLOC;
-        meta->type = TSK_FS_META_TYPE_UNDEF;
-        meta->size = 0;
-    }
-    else {
-        meta->flags = TSK_FS_META_FLAG_ALLOC;
+    meta->flags = TSK_FS_META_FLAG_ALLOC;
 
+    /* Meta-Type aus POSIX mode ableiten */
+    meta->type = TSK_FS_META_TYPE_UNDEF;
+    {
         uint16_t fmt = meta->mode & S_IFMT;
-        if (fmt == S_IFDIR)  meta->type = TSK_FS_META_TYPE_DIR;
-        else if (fmt == S_IFREG)  meta->type = TSK_FS_META_TYPE_REG;
-        else if (fmt == S_IFLNK)  meta->type = TSK_FS_META_TYPE_LNK;
-        else if (fmt == S_IFCHR)  meta->type = TSK_FS_META_TYPE_CHR;
-        else if (fmt == S_IFBLK)  meta->type = TSK_FS_META_TYPE_BLK;
-        else if (fmt == S_IFIFO)  meta->type = TSK_FS_META_TYPE_FIFO;
+        if (fmt == S_IFDIR) meta->type = TSK_FS_META_TYPE_DIR;
+        else if (fmt == S_IFREG) meta->type = TSK_FS_META_TYPE_REG;
+        else if (fmt == S_IFLNK) meta->type = TSK_FS_META_TYPE_LNK;
+        else if (fmt == S_IFBLK) meta->type = TSK_FS_META_TYPE_BLK;
+        else if (fmt == S_IFCHR) meta->type = TSK_FS_META_TYPE_CHR;
+        else if (fmt == S_IFIFO) meta->type = TSK_FS_META_TYPE_FIFO;
         else if (fmt == S_IFSOCK) meta->type = TSK_FS_META_TYPE_SOCK;
-        else                     meta->type = TSK_FS_META_TYPE_UNDEF;
     }
 
     /*
-     * VERY IMPORTANT:
-     * Leave attr NULL so load_attrs() is triggered later.
+     * WICHTIG:
+     * meta->attr hier NICHT anlegen.
+     * icat/tsk_fs_file_walk() triggert load_attrs() nur wenn meta->attr == NULL.
      */
     meta->attr = NULL;
 
     return 0;
 }
-
-
 
 static TSK_RETVAL_ENUM qnx6fs_dir_open_meta(TSK_FS_INFO *fs, TSK_FS_DIR **a_fs_dir, TSK_INUM_T inum, int recursion_depth) {
     (void)recursion_depth;
@@ -620,12 +615,16 @@ static uint8_t qnx6fs_fsstat(TSK_FS_INFO *fs, FILE *hFile) {
     return 0;
 }
 
-#include "tsk/fs/tsk_fs_i.h"   // für tsk_fs_block_alloc/free + tsk_malloc (je nach Layout)
+#include "tsk/fs/tsk_fs_i.h"   // fï¿½r tsk_fs_block_alloc/free + tsk_malloc (je nach Layout)
 
 
 static uint8_t
-qnx6fs_block_walk(TSK_FS_INFO* fs, TSK_DADDR_T start, TSK_DADDR_T end,
-    TSK_FS_BLOCK_WALK_FLAG_ENUM flags, TSK_FS_BLOCK_WALK_CB cb, void* ptr)
+qnx6fs_block_walk(TSK_FS_INFO* fs,
+    TSK_DADDR_T start,
+    TSK_DADDR_T end,
+    TSK_FS_BLOCK_WALK_FLAG_ENUM flags,
+    TSK_FS_BLOCK_WALK_CB cb,
+    void* ptr)
 {
     if (fs == NULL || cb == NULL) {
         tsk_error_reset();
@@ -635,64 +634,62 @@ qnx6fs_block_walk(TSK_FS_INFO* fs, TSK_DADDR_T start, TSK_DADDR_T end,
     }
 
     /* clamp range */
-    if (start < fs->first_block) start = fs->first_block;
-    if (end > fs->last_block) end = fs->last_block;
-    if (start > end) return 0;
+    if (start < fs->first_block)
+        start = fs->first_block;
+    if (end > fs->last_block)
+        end = fs->last_block;
+    if (start > end)
+        return 0;
 
     TSK_FS_BLOCK* fs_block = tsk_fs_block_alloc(fs);
     if (fs_block == NULL) {
+        tsk_error_reset();
+        tsk_error_set_errno(TSK_ERR_AUX_MALLOC);
+        tsk_error_set_errstr("qnx6fs_block_walk: cannot allocate TSK_FS_BLOCK");
         return 1;
     }
 
     for (TSK_DADDR_T addr = start; addr <= end; addr++) {
 
-        /* flags for this block */
-        TSK_FS_BLOCK_FLAG_ENUM blk_flags = (TSK_FS_BLOCK_FLAG_ENUM)0;
-        if (fs->block_getflags) {
-            blk_flags = fs->block_getflags(fs, addr);
-        }
-        else {
-            /* fallback */
-            blk_flags = (TSK_FS_BLOCK_FLAG_ENUM)(TSK_FS_BLOCK_FLAG_ALLOC | TSK_FS_BLOCK_FLAG_CONT);
-        }
+        TSK_FS_BLOCK_FLAG_ENUM blk_flags = qnx6fs_block_getflags(fs, addr);
 
-        /* AONLY: don't read bytes */
+        /* if caller only wants alloc/unalloc filtering */
+        if ((flags & TSK_FS_BLOCK_WALK_FLAG_ALLOC) && !(blk_flags & TSK_FS_BLOCK_FLAG_ALLOC))
+            continue;
+        if ((flags & TSK_FS_BLOCK_WALK_FLAG_UNALLOC) && (blk_flags & TSK_FS_BLOCK_FLAG_ALLOC))
+            continue;
+
+        /* AONLY: don't read content */
         if (flags & TSK_FS_BLOCK_WALK_FLAG_AONLY) {
-            TSK_FS_BLOCK_FLAG_ENUM out_flags =
-                (TSK_FS_BLOCK_FLAG_ENUM)(blk_flags | TSK_FS_BLOCK_FLAG_AONLY);
-
+            TSK_FS_BLOCK_FLAG_ENUM out_flags = (TSK_FS_BLOCK_FLAG_ENUM)(blk_flags | TSK_FS_BLOCK_FLAG_AONLY);
             tsk_fs_block_set(fs, fs_block, addr, out_flags, NULL);
 
-            TSK_WALK_RET_ENUM r = cb(fs_block, ptr);
-            if (r == TSK_WALK_STOP) break;
-            if (r == TSK_WALK_ERROR) {
+            if (cb(fs_block, ptr)) {
                 tsk_fs_block_free(fs_block);
                 return 1;
             }
             continue;
         }
 
-        /* read raw block bytes */
+        /* read block content */
         TSK_OFF_T off = fs->offset + (TSK_OFF_T)addr * (TSK_OFF_T)fs->block_size;
-        ssize_t rd = tsk_img_read(fs->img_info, off, (char*)fs_block->buf, fs->block_size);
-        if (rd != (ssize_t)fs->block_size) {
+        ssize_t r = tsk_img_read(fs->img_info, off, (char*)fs_block->buf, fs->block_size);
+        if (r != (ssize_t)fs->block_size) {
             tsk_error_reset();
             tsk_error_set_errno(TSK_ERR_FS_READ);
             tsk_error_set_errstr("qnx6fs_block_walk: cannot read block");
-            /* PRIuOFF macht bei dir immer wieder Stress -> cast + %llu */
-            tsk_error_set_errstr2("block=%" PRIuDADDR " off=%llu", addr, (unsigned long long)off);
+            /* avoid PRIuOFF trouble */
+            tsk_error_set_errstr2("block=%" PRIuDADDR " off=%llu",
+                addr, (unsigned long long)off);
             tsk_fs_block_free(fs_block);
             return 1;
         }
 
-        /* RAW => buf valid */
-        tsk_fs_block_set(fs, fs_block, addr,
-            (TSK_FS_BLOCK_FLAG_ENUM)(blk_flags | TSK_FS_BLOCK_FLAG_RAW),
-            (char*)fs_block->buf);
+        /* mark buffer as valid raw content */
+        TSK_FS_BLOCK_FLAG_ENUM out_flags = (TSK_FS_BLOCK_FLAG_ENUM)(blk_flags | TSK_FS_BLOCK_FLAG_RAW);
+        tsk_fs_block_set(fs, fs_block, addr, out_flags, (char*)fs_block->buf);
 
-        TSK_WALK_RET_ENUM r = cb(fs_block, ptr);
-        if (r == TSK_WALK_STOP) break;
-        if (r == TSK_WALK_ERROR) {
+        if (cb(fs_block, ptr)) {
             tsk_fs_block_free(fs_block);
             return 1;
         }
@@ -713,46 +710,75 @@ qnx6fs_inode_walk(TSK_FS_INFO* fs, TSK_INUM_T start, TSK_INUM_T end,
         return 1;
     }
 
-    /* TSK convention: flags==0 => both */
-    if (flags == 0) {
-        flags = (TSK_FS_META_FLAG_ENUM)(TSK_FS_META_FLAG_ALLOC | TSK_FS_META_FLAG_UNALLOC);
-    }
+    QNX6FS_INFO* qfs = (QNX6FS_INFO*)fs;
 
-    /* clamp */
+    /* Clamp range */
     if (start < fs->first_inum) start = fs->first_inum;
     if (end > fs->last_inum) end = fs->last_inum;
     if (start > end) return 0;
 
     for (TSK_INUM_T inum = start; inum <= end; inum++) {
 
-        TSK_FS_FILE* fs_file = tsk_fs_file_open_meta(fs, NULL, inum);
-        if (fs_file == NULL || fs_file->meta == NULL) {
-            if (fs_file) tsk_fs_file_close(fs_file);
-            continue; /* nicht hart failen, ils will "weiter" */
+        /* Read inode first to decide alloc/unalloc quickly */
+        QNX6_INODE ino;
+        if (qnx6_read_inode(qfs, inum, &ino)) {
+            /* unreadable inode -> treat as skip (or could report UNALLOC) */
+            continue;
         }
 
-        /* Filter by alloc/unalloc */
-        const TSK_FS_META* m = fs_file->meta;
-        int is_alloc = (m->flags & TSK_FS_META_FLAG_ALLOC) ? 1 : 0;
+        /* Simple allocation heuristic:
+           - if mode == 0 -> unalloc
+           - else alloc
+           (Wenn du ein besseres Bit/Flag im inode hast, hier ersetzen!)
+        */
+        uint16_t mode = tsk_getu16(TSK_LIT_ENDIAN, (const uint8_t*)&ino.mode);
+        uint8_t is_alloc = (mode != 0);
+
+        /* Apply requested flags (best-effort, like other FS drivers) */
         if (is_alloc) {
-            if ((flags & TSK_FS_META_FLAG_ALLOC) == 0) {
+            if ((flags & TSK_FS_META_FLAG_UNALLOC) && !(flags & TSK_FS_META_FLAG_ALLOC)) {
+                continue;
+            }
+        }
+        else {
+            if ((flags & TSK_FS_META_FLAG_ALLOC) && !(flags & TSK_FS_META_FLAG_UNALLOC)) {
+                continue;
+            }
+        }
+
+        /* Build a TSK_FS_FILE for callback */
+        TSK_FS_FILE* fs_file = tsk_fs_file_alloc(fs);
+        if (fs_file == NULL) {
+            return 1;
+        }
+
+        /* Populate meta via driver hook */
+        if (fs->file_add_meta) {
+            if (fs->file_add_meta(fs, fs_file, inum)) {
                 tsk_fs_file_close(fs_file);
                 continue;
             }
         }
         else {
-            if ((flags & TSK_FS_META_FLAG_UNALLOC) == 0) {
-                tsk_fs_file_close(fs_file);
-                continue;
-            }
+            tsk_fs_file_close(fs_file);
+            continue;
         }
 
-        TSK_WALK_RET_ENUM r = cb(fs_file, ptr);
+        /* Ensure alloc/unalloc is consistent with our heuristic */
+        if (fs_file->meta) {
+            if (is_alloc)
+                fs_file->meta->flags = (TSK_FS_META_FLAG_ENUM)(fs_file->meta->flags | TSK_FS_META_FLAG_ALLOC);
+            else
+                fs_file->meta->flags = (TSK_FS_META_FLAG_ENUM)(fs_file->meta->flags | TSK_FS_META_FLAG_UNALLOC);
+        }
+
+        /* Callback */
+        if (cb(fs_file, ptr)) {
+            tsk_fs_file_close(fs_file);
+            return 1;
+        }
 
         tsk_fs_file_close(fs_file);
-
-        if (r == TSK_WALK_STOP) break;
-        if (r == TSK_WALK_ERROR) return 1;
     }
 
     return 0;
@@ -811,43 +837,103 @@ qnx6fs_open(TSK_IMG_INFO* img_info, TSK_OFF_T offset, TSK_FS_TYPE_ENUM fstype, c
         return NULL;
     }
 
-    TSK_OFF_T sb0_off = offset + (TSK_OFF_T)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&boot.sblk0) * 512;
-    TSK_OFF_T sb1_off = offset + (TSK_OFF_T)tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&boot.sblk1) * 512;
+    uint32_t sblk0 = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&boot.sblk0);
+uint32_t sblk1 = tsk_getu32(TSK_LIT_ENDIAN, (const uint8_t*)&boot.sblk1);
 
-    uint8_t raw0[512];
-    uint8_t raw1[512];
-    if (qnx6_read_img(img_info, sb0_off, raw0, sizeof(raw0)) || qnx6_read_img(img_info, sb1_off, raw1, sizeof(raw1))) {
-        if (test) return NULL;
-        tsk_error_reset();
-        tsk_error_set_errno(TSK_ERR_FS_READ);
-        tsk_error_set_errstr("qnx6fs_open: Cannot read superblocks");
-        return NULL;
+/* Superblock is stored in a fixed 0x1000-byte area, independent of FS blocksize.
+ * Most images use 512-byte units for sblk0/sblk1, but some vendors store it in
+ * (blocksize/2) units (e.g., blocksize=2048 -> unit=1024). We therefore probe
+ * several plausible multipliers and then validate via magic + CRC. */
+static const uint32_t sb_mults[] = { 512, 1024, 2048, 4096, 8192 };
+
+uint8_t raw0[512];
+uint8_t raw1[512];
+memset(raw0, 0, sizeof(raw0));
+memset(raw1, 0, sizeof(raw1));
+
+TSK_OFF_T sb0_off = 0, sb1_off = 0;
+int have0 = 0, have1 = 0;
+
+for (size_t i = 0; i < sizeof(sb_mults)/sizeof(sb_mults[0]); i++) {
+    if (!have0) {
+        TSK_OFF_T off = offset + (TSK_OFF_T)sblk0 * (TSK_OFF_T)sb_mults[i];
+        if (qnx6_read_img(img_info, off, raw0, sizeof(raw0)) == 0) {
+            if (raw0[0] == 0x22 && raw0[1] == 0x11 && raw0[2] == 0x19 && raw0[3] == 0x68) {
+                have0 = 1;
+                sb0_off = off;
+            }
+        }
     }
-
-    int valid0 = (raw0[0] == 0x22 && raw0[1] == 0x11 && raw0[2] == 0x19 && raw0[3] == 0x68);
-    int valid1 = (raw1[0] == 0x22 && raw1[1] == 0x11 && raw1[2] == 0x19 && raw1[3] == 0x68);
-
-    if (!valid0 && !valid1) {
-        if (test) return NULL;
-        tsk_error_reset();
-        tsk_error_set_errno(TSK_ERR_FS_UNKTYPE);
-        tsk_error_set_errstr("qnx6fs_open: Superblock magic mismatch");
-        return NULL;
+    if (!have1) {
+        TSK_OFF_T off = offset + (TSK_OFF_T)sblk1 * (TSK_OFF_T)sb_mults[i];
+        if (qnx6_read_img(img_info, off, raw1, sizeof(raw1)) == 0) {
+            if (raw1[0] == 0x22 && raw1[1] == 0x11 && raw1[2] == 0x19 && raw1[3] == 0x68) {
+                have1 = 1;
+                sb1_off = off;
+            }
+        }
     }
+    if (have0 && have1) break;
+}
 
-    uint64_t serial0 = 0, serial1 = 0;
-    int ok0 = valid0 ? qnx6_check_superblock_512(raw0, &serial0) : 0;
-    int ok1 = valid1 ? qnx6_check_superblock_512(raw1, &serial1) : 0;
-
-    if (!ok0 && !ok1) {
-        if (test) return NULL;
-        tsk_error_reset();
-        tsk_error_set_errno(TSK_ERR_FS_CORRUPT);
-        tsk_error_set_errstr("qnx6fs_open: Superblock CRC mismatch");
-        return NULL;
+/* Fallbacks seen in the wild: superblock starts at byte 0 or at 0x2000 (bootblock size). */
+if (!have0) {
+    TSK_OFF_T off = offset;
+    if (qnx6_read_img(img_info, off, raw0, sizeof(raw0)) == 0 &&
+        raw0[0] == 0x22 && raw0[1] == 0x11 && raw0[2] == 0x19 && raw0[3] == 0x68) {
+        have0 = 1;
+        sb0_off = off;
     }
+}
+if (!have0) {
+    TSK_OFF_T off = offset + 0x2000;
+    if (qnx6_read_img(img_info, off, raw0, sizeof(raw0)) == 0 &&
+        raw0[0] == 0x22 && raw0[1] == 0x11 && raw0[2] == 0x19 && raw0[3] == 0x68) {
+        have0 = 1;
+        sb0_off = off;
+    }
+}
+if (!have1) {
+    TSK_OFF_T off = offset;
+    if (qnx6_read_img(img_info, off, raw1, sizeof(raw1)) == 0 &&
+        raw1[0] == 0x22 && raw1[1] == 0x11 && raw1[2] == 0x19 && raw1[3] == 0x68) {
+        have1 = 1;
+        sb1_off = off;
+    }
+}
+if (!have1) {
+    TSK_OFF_T off = offset + 0x2000;
+    if (qnx6_read_img(img_info, off, raw1, sizeof(raw1)) == 0 &&
+        raw1[0] == 0x22 && raw1[1] == 0x11 && raw1[2] == 0x19 && raw1[3] == 0x68) {
+        have1 = 1;
+        sb1_off = off;
+    }
+}
 
-    const uint8_t *raw = (ok0 && (!ok1 || serial0 >= serial1)) ? raw0 : raw1;
+int valid0 = have0;
+int valid1 = have1;
+
+if (!valid0 && !valid1) {
+    if (test) return NULL;
+    tsk_error_reset();
+    tsk_error_set_errno(TSK_ERR_FS_UNKTYPE);
+    tsk_error_set_errstr("qnx6fs_open: Superblock magic mismatch");
+    return NULL;
+}
+
+uint64_t serial0 = 0, serial1 = 0;
+int ok0 = valid0 ? qnx6_check_superblock_512(raw0, &serial0) : 0;
+int ok1 = valid1 ? qnx6_check_superblock_512(raw1, &serial1) : 0;
+
+if (!ok0 && !ok1) {
+    if (test) return NULL;
+    tsk_error_reset();
+    tsk_error_set_errno(TSK_ERR_FS_CORRUPT);
+    tsk_error_set_errstr("qnx6fs_open: Superblock CRC mismatch");
+    return NULL;
+}
+
+const uint8_t *raw = (ok0 && (!ok1 || serial0 >= serial1)) ? raw0 : raw1;
 
     QNX6FS_INFO *qfs = (QNX6FS_INFO*)tsk_fs_malloc(sizeof(QNX6FS_INFO));
     if (qfs == NULL) {

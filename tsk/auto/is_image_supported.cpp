@@ -76,7 +76,7 @@ std::string TskIsImageSupported::getSingleLineErrorMessage() {
     }
 
     // Default message
-    return "Error loading file systems";
+    return "Error loading file systems Gerd";
 }
 
 void TskIsImageSupported::printResults() {

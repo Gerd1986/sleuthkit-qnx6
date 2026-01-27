@@ -18,7 +18,7 @@
 
 /* Global variables that fit here as well as anywhere */
 char *progname = "unknown";
-int tsk_verbose = 1;
+int tsk_verbose = 0;
 
 /* Optional error listener */
 TSK_ERROR_LISTENER_CB error_listener = NULL;

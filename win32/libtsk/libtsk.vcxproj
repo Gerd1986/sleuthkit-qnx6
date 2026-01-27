@@ -311,12 +311,7 @@ xcopy /E /Y "$(VCInstallDir)\redist\MSVC\$(VCToolsRedistVersion)\$(PlatformTarge
       <DisableSpecificWarnings>4200;4814;5030</DisableSpecificWarnings>
     </ClCompile>
     <PreBuildEvent>
-      <Command>copy "$(LibEwfLib)\libewf.dll" "$(OutDir)"
-copy "$(ZlibDll)\zlib.dll" "$(OutDir)"
-copy "$(LibVmdkLib)\libvmdk.dll" "$(OutDir)"
-copy "$(LibVhdiLib)\libvhdi.dll" "$(OutDir)"
-xcopy /E /Y "$(UniversalCRTSdkDir)\redist\ucrt\DLLS\$(PlatformTarget)" "$(OutDir)"
-xcopy /E /Y "$(VCInstallDir)\redist\MSVC\$(VCToolsRedistVersion)\$(PlatformTarget)\Microsoft.VC142.CRT" "$(OutDir)"</Command>
+      <Command>echo LibEwfLib=$(LibEwfLib) echo ZlibDll=$(ZlibDll) echo LibVmdkLib=$(LibVmdkLib)</Command>
     </PreBuildEvent>
     <Lib>
       <AdditionalDependencies>mbedcrypto.lib;mbedtls.lib;%(AdditionalDependencies)</AdditionalDependencies>
